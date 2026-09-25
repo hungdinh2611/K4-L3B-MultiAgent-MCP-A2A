@@ -80,15 +80,20 @@ def validate_artifacts(
         seen_events.add(event["event_id"])
         normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
 
+<<<<<<< HEAD
+=======
     _validate_lifecycle(trace_lines)
     _validate_evidence_present(outputs)
 
+>>>>>>> 9a7a84c24ef1cfa8a96be6d80805dc1c9e3b0e8e
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):
         raise ValueError("a Team API Key appears in output or trace")
     return outputs, normalized_lines
 
 
+<<<<<<< HEAD
+=======
 def _validate_evidence_present(outputs: dict[str, dict[str, Any]]) -> None:
     """Refuse a set of results that no MCP evidence stands behind.
 
@@ -136,6 +141,7 @@ def _validate_lifecycle(trace_lines: list[str]) -> None:
             raise ValueError(f"traces/trace.jsonl: {case_id} finalized before verification")
 
 
+>>>>>>> 9a7a84c24ef1cfa8a96be6d80805dc1c9e3b0e8e
 def package_submission(root: Path, destination: Path) -> Path:
     from .cases import load_case_set
 

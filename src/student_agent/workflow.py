@@ -39,6 +39,10 @@ class Coordinator:
                 "get_customer_history" if "customer" in entity.payload.get("evidence", {})
                 else "get_order"
             ),
+<<<<<<< HEAD
+            "duplicated_records": bool(entity.payload.get("duplicated_records")),
+=======
+>>>>>>> 9a7a84c24ef1cfa8a96be6d80805dc1c9e3b0e8e
         }  # fmt: skip
         order = await ctx.dispatch(
             self.agents["order-agent"], self.task(ctx, "order-agent", "investigate_order", **scope)

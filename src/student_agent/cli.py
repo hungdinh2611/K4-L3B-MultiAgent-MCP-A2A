@@ -5,11 +5,8 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Any
 
-import httpx2
-
-from .cases import CaseSet, load_case_set
+from .cases import load_case_set
 from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import EvidenceGateway, connect_gateway
@@ -17,6 +14,8 @@ from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
 from .workflow import solve_case
 
+<<<<<<< HEAD
+=======
 # The gateway occasionally drops a streamable HTTP session mid-request, which
 # tears down the whole MCP transport rather than one call.  Reconnect and resume
 # from the last committed case instead of losing the run.
@@ -33,11 +32,14 @@ MAX_CASE_FAULTS = 3
 # results.  Stop instead, so an outage is never mistaken for a finished run.
 MAX_BARREN_CASES = 3
 
+>>>>>>> 9a7a84c24ef1cfa8a96be6d80805dc1c9e3b0e8e
 
 def _root(value: str) -> Path:
     return Path(value).resolve()
 
 
+<<<<<<< HEAD
+=======
 def _transient_only(error: BaseException) -> bool:
     if isinstance(error, BaseExceptionGroup):
         return bool(error.exceptions) and all(
@@ -63,6 +65,7 @@ def _primary_error(error: BaseException) -> BaseException:
     return unwrapped[0]
 
 
+>>>>>>> 9a7a84c24ef1cfa8a96be6d80805dc1c9e3b0e8e
 async def _show_tools(root: Path) -> None:
     settings = Settings.load(root)
     contracts = Contracts(root / "contracts" / "schemas")
@@ -71,6 +74,8 @@ async def _show_tools(root: Path) -> None:
             print(tool)
 
 
+<<<<<<< HEAD
+=======
 def _write_output(output_root: Path, case_id: str, output: dict[str, Any]) -> None:
     target = output_root / f"{case_id}.json"
     temporary = target.with_suffix(".json.tmp")
@@ -140,6 +145,7 @@ async def _drive_session(
             progress["committed"] = trace_path.stat().st_size
 
 
+>>>>>>> 9a7a84c24ef1cfa8a96be6d80805dc1c9e3b0e8e
 async def _run(root: Path) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
@@ -151,50 +157,26 @@ async def _run(root: Path) -> None:
     for stale in output_root.glob("*.json"):
         stale.unlink()
     trace_path.unlink(missing_ok=True)
-    trace_path.touch()
     trace = TraceWriter(trace_path, contracts)
 
-    progress: dict[str, Any] = {"done": [], "committed": 0}
-    faults: dict[str, int] = {}
-    total = len(case_set.case_ids)
-    for _ in range(MAX_SESSIONS):
-        finished = set(progress["done"])
-        pending = [case_id for case_id in case_set.case_ids if case_id not in finished]
-        if not pending:
-            return
-        try:
-            await _drive_session(
-                settings,
-                contracts,
-                case_set,
-                pending,
-                trace,
-                trace_path,
-                output_root,
-                progress,
+    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
+        discovered_tools = await gateway.list_tools()
+        if not discovered_tools:
+            raise RuntimeError("MCP Gateway returned no tools")
+        for case_id in case_set.case_ids:
+            case = case_set.cases[case_id]
+            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+            output = await solve_case(case, gateway, trace)
+            contracts.validate_output(output, f"outputs/{case_id}.json")
+            if output.get("case_id") != case_id:
+                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+            target = output_root / f"{case_id}.json"
+            temporary = target.with_suffix(".json.tmp")
+            temporary.write_text(
+                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
-        except Exception as error:
-            if not _transient_only(error):
-                raise
-            solved = set(progress["done"])
-            blocked = [case_id for case_id in pending if case_id not in solved]
-            if not blocked:
-                return
-            stalled = blocked[0]
-            faults[stalled] = faults.get(stalled, 0) + 1
-            if faults[stalled] >= MAX_CASE_FAULTS:
-                raise RuntimeError(
-                    f"{stalled}: gateway session failed {MAX_CASE_FAULTS} times"
-                ) from error
-            # Drop the half-written events so the trace matches the outputs.
-            with trace_path.open("r+b") as handle:
-                handle.truncate(progress["committed"])
-            print(
-                f"reconnecting after a gateway transport fault "
-                f"({len(progress['done'])}/{total} cases complete)",
-                file=sys.stderr,
-            )
-    raise RuntimeError(f"gateway session could not be sustained for {MAX_SESSIONS} attempts")
+            temporary.replace(target)
+            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
 
 
 def parser() -> argparse.ArgumentParser:
