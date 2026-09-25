@@ -80,10 +80,44 @@ def validate_artifacts(
         seen_events.add(event["event_id"])
         normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
 
+    _validate_lifecycle(trace_lines)
+
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):
         raise ValueError("a Team API Key appears in output or trace")
     return outputs, normalized_lines
+
+
+def _validate_lifecycle(trace_lines: list[str]) -> None:
+    """Check each case carries the lifecycle the scoring policy requires.
+
+    Workflow credit rests on lifecycle-event coverage and receive/finalize
+    ordering, so this reads the whole trace file rather than one case's view of
+    it and confirms both before a submission is built.
+    """
+    from .workflow import required_lifecycle_events
+
+    per_case: dict[str, list[str]] = {}
+    for line in trace_lines:
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        per_case.setdefault(event["case_id"], []).append(event["event_type"])
+
+    required = required_lifecycle_events()
+    for case_id, kinds in per_case.items():
+        missing = [event for event in required if event not in kinds]
+        if missing:
+            raise ValueError(f"traces/trace.jsonl: {case_id} is missing {missing}")
+        if kinds[0] != "case_received":
+            raise ValueError(f"traces/trace.jsonl: {case_id} does not open with case_received")
+        if kinds[-1] != "case_finalized":
+            raise ValueError(f"traces/trace.jsonl: {case_id} does not close with case_finalized")
+        for event in ("case_received", "case_finalized"):
+            if kinds.count(event) != 1:
+                raise ValueError(f"traces/trace.jsonl: {case_id} repeats {event}")
+        if kinds.index("verification_completed") > kinds.index("case_finalized"):
+            raise ValueError(f"traces/trace.jsonl: {case_id} finalized before verification")
 
 
 def package_submission(root: Path, destination: Path) -> Path:

@@ -1,5 +1,6 @@
-import pytest
 from pathlib import Path
+
+import pytest
 
 
 def test_repository_contains_no_competition_payload() -> None:
