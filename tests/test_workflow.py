@@ -7,18 +7,17 @@ from typing import Any
 
 import pytest
 
-from student_agent.contracts import Contracts
-from student_agent.trace import TraceWriter
-from student_agent.workflow import (
-    EvidenceDesk,
-    EvidenceLedger,
+from student_agent.a2a import CaseContext, EvidenceLedger
+from student_agent.agents import (
     OrderFacts,
     PaymentFinding,
     ShipmentFinding,
     classify,
     resolve_entity,
-    solve_case,
 )
+from student_agent.contracts import Contracts
+from student_agent.trace import TraceWriter
+from student_agent.workflow import solve_case
 
 ROOT = Path(__file__).resolve().parents[1]
 ORDER_ID = "af0bbb47f125381ce9f3597dc70ef07b"
@@ -92,9 +91,23 @@ class FakeGateway:
         return outcome
 
 
-def desk_for(tmp_path: Path, gateway: FakeGateway, case_id: str = "L3B_CASE_001") -> EvidenceDesk:
+def desk_for(
+    tmp_path: Path,
+    gateway: FakeGateway,
+    case_id: str = "L3B_CASE_001",
+    *,
+    shipment: ShipmentFinding | None = None,
+) -> CaseContext:
+    """A context wired to a canned gateway, for one agent's logic at a time.
+
+    ``shipment`` stands in for the shipment agent where the code under test waits
+    on its verdict, so a unit test need not run the whole fan-out to reach it.
+    """
     trace = TraceWriter(tmp_path / "trace.jsonl", contracts())
-    return EvidenceDesk(case_id, gateway, trace, EvidenceLedger())
+    ctx = CaseContext({"case_id": case_id}, gateway, trace)
+    if shipment is not None:
+        ctx.announce("shipment", shipment)
+    return ctx
 
 
 def trace_events(tmp_path: Path) -> list[dict[str, Any]]:
@@ -184,7 +197,7 @@ def _moment(value: str):
 
 
 def scope_stub(**overrides: Any):
-    from student_agent.workflow import OrderScope
+    from student_agent.agents import OrderScope
 
     scope = OrderScope(order_id=ORDER_ID, status="delivered", resolved=True)
     for key, value in overrides.items():
@@ -420,14 +433,14 @@ def test_solve_case_survives_a_gateway_that_answers_nothing(tmp_path: Path) -> N
     assert output["financial_resolution"]["refund_lines"] == []
 
 
-def test_colliding_revisions_are_split_by_the_refund_lifecycle(tmp_path: Path) -> None:
+def test_colliding_revisions_are_split_by_what_settles_the_order(tmp_path: Path) -> None:
     """Both revisions share a purchase date, so timestamps cannot separate them.
 
-    The single 52.00 capture is the revision the failed refund was raised
-    against; the 44.50 pair belongs to the other revision and must not be read
-    as a duplicate charge.
+    The 44.50 pair adds up to the order, so that is the revision under
+    investigation; the lone 52.00 belongs to the other one and the pair must not
+    be read as a duplicate charge.
     """
-    from student_agent.workflow import investigate_payment
+    from student_agent.agents import investigate_payment
 
     def event(at: str, amount: str) -> dict[str, Any]:
         return {
@@ -486,19 +499,96 @@ def test_colliding_revisions_are_split_by_the_refund_lifecycle(tmp_path: Path) -
         estimated_at=_moment("2018-05-21T09:00:00-03:00"),
     )
     facts = OrderFacts(order_value=Decimal("89.00"), seller_ids=["seller-af0bbb47f125"])
-    payment = asyncio.run(investigate_payment(desk_for(tmp_path, gateway), scope, facts))
+    payment = asyncio.run(
+        investigate_payment(
+            desk_for(tmp_path, gateway, shipment=ShipmentFinding(available=True)), scope, facts
+        )
+    )
 
     assert payment.capture_ambiguous is True
-    assert payment.capture_scoped_by_refund is True
+    assert payment.capture_scoped_by_order_value is True
     assert payment.capture_unresolved is False
-    assert payment.capture_amounts == [Decimal("52.00")]
-    assert payment.captured_total == Decimal("52.00")
+    assert payment.capture_amounts == [Decimal("44.50"), Decimal("44.50")]
+    assert payment.captured_total == Decimal("89.00")
     assert payment.duplicate_capture is False
-    assert payment.refund_state == "failed"
-    assert payment.references == ["1"]
+    # The 52.00 refund repays the other revision, so it stays out of scope.
+    assert payment.refund_state is None
+    assert payment.references == ["1", "2"]
     assert classify(scope, facts, ShipmentFinding(available=True, verdict="on_time"), payment) == (
-        "refund_failed"
+        "valid_split_payment"
     )
+
+
+def test_the_refund_lifecycle_breaks_a_tie_no_amount_settles(tmp_path: Path) -> None:
+    """With nothing adding up to the order, the refund names the revision."""
+    from decimal import Decimal
+
+    from student_agent.agents import investigate_payment
+
+    def event(at: str, amount: str) -> dict[str, Any]:
+        return {
+            "order_id": ORDER_ID,
+            "event_at": at,
+            "event_type": "captured",
+            "amount_brl": amount,
+            "status": "confirmed",
+        }
+
+    gateway = FakeGateway(
+        {
+            "get_payment_timeline": envelope(
+                "payment",
+                {
+                    "order_id": ORDER_ID,
+                    "payments": [
+                        {"order_id": ORDER_ID, "payment_sequential": "1",
+                         "payment_type": "credit_card", "payment_value": "52.00"},
+                        {"order_id": ORDER_ID, "payment_sequential": "2",
+                         "payment_type": "voucher", "payment_value": "31.00"},
+                    ],
+                    "events": [
+                        event("2018-05-11T10:00:00-03:00", "52.00"),
+                        event("2018-05-11T10:00:00-03:00", "31.00"),
+                        event("2018-05-11T11:00:00-03:00", "27.00"),
+                    ],
+                },
+            ),
+            "get_refund_timeline": envelope(
+                "refund",
+                {
+                    "order_id": ORDER_ID,
+                    "events": [
+                        {
+                            "order_id": ORDER_ID,
+                            "event_at": "2018-05-22T09:00:00-03:00",
+                            "event_type": "refund_requested",
+                            "amount_brl": "27.00",
+                            "status": "failed",
+                        }
+                    ],
+                },
+                ref="ev_" + "d" * 24,
+            ),
+        }
+    )
+    scope = scope_stub(
+        purchase_at=_moment("2018-05-11T09:00:00-03:00"),
+        approved_at=_moment("2018-05-11T10:00:00-03:00"),
+        delivered_at=_moment("2018-05-20T09:00:00-03:00"),
+        estimated_at=_moment("2018-05-21T09:00:00-03:00"),
+    )
+    facts = OrderFacts(order_value=Decimal("120.00"), seller_ids=["seller-af0bbb47f125"])
+    payment = asyncio.run(
+        investigate_payment(
+            desk_for(tmp_path, gateway, shipment=ShipmentFinding(available=True)), scope, facts
+        )
+    )
+
+    assert payment.capture_ambiguous is True
+    assert payment.capture_scoped_by_order_value is False
+    assert payment.capture_scoped_by_refund is True
+    assert payment.capture_amounts == [Decimal("27.00")]
+    assert payment.refund_state == "failed"
 
 
 # --------------------------------------------------------------- Phase 4
@@ -573,7 +663,7 @@ GOOD_SEQUENCE = ["task_assigned", "tool_result_consumed", "handoff", "policy_dec
 
 
 def test_verifier_accepts_a_consistent_result() -> None:
-    from student_agent.workflow import verify
+    from student_agent.agents import verify
 
     verdict = verify(_clean_output(), _loaded_ledger(), _delivered_scope(), list(GOOD_SEQUENCE))
     assert verdict == "ARBITRATION_AND_REFUND_VALIDATED"
@@ -581,7 +671,7 @@ def test_verifier_accepts_a_consistent_result() -> None:
 
 def test_verifier_rejects_a_party_the_issue_does_not_answer() -> None:
     """A seller delay cannot leave the logistics provider paying."""
-    from student_agent.workflow import verify
+    from student_agent.agents import verify
 
     output = _clean_output()
     output["root_cause_analysis"]["responsible_parties"] = [
@@ -592,7 +682,7 @@ def test_verifier_rejects_a_party_the_issue_does_not_answer() -> None:
 
 
 def test_verifier_rejects_an_issue_that_contradicts_the_timeline() -> None:
-    from student_agent.workflow import verify
+    from student_agent.agents import verify
 
     output = _clean_output()
     output["shipment_analysis"]["verdict"] = "on_time"
@@ -602,7 +692,7 @@ def test_verifier_rejects_an_issue_that_contradicts_the_timeline() -> None:
 
 
 def test_verifier_rejects_a_refund_no_line_pays_for() -> None:
-    from student_agent.workflow import verify
+    from student_agent.agents import verify
 
     output = _clean_output()
     output["financial_resolution"]["refund_lines"] = []
@@ -611,7 +701,7 @@ def test_verifier_rejects_a_refund_no_line_pays_for() -> None:
 
 
 def test_verifier_rejects_no_action_carrying_a_refund() -> None:
-    from student_agent.workflow import verify
+    from student_agent.agents import verify
 
     output = _clean_output()
     output["assessment"]["case_status"] = "no_action"
@@ -620,7 +710,7 @@ def test_verifier_rejects_no_action_carrying_a_refund() -> None:
 
 
 def test_verifier_rejects_a_late_seller_from_another_order() -> None:
-    from student_agent.workflow import verify
+    from student_agent.agents import verify
 
     output = _clean_output()
     output["shipment_analysis"]["late_seller_ids"] = ["seller-somewhere-else"]
@@ -629,7 +719,7 @@ def test_verifier_rejects_a_late_seller_from_another_order() -> None:
 
 
 def test_verifier_rejects_a_rejected_candidate_reported_as_an_entity() -> None:
-    from student_agent.workflow import verify
+    from student_agent.agents import verify
 
     output = _clean_output()
     output["affected_entities"]["order_ids"] = [ORDER_ID, "candidate-001"]
@@ -638,7 +728,7 @@ def test_verifier_rejects_a_rejected_candidate_reported_as_an_entity() -> None:
 
 
 def test_verifier_rejects_a_missing_lifecycle_event() -> None:
-    from student_agent.workflow import verify
+    from student_agent.agents import verify
 
     without_handoff = ["task_assigned", "tool_result_consumed", "policy_decided"]
     with pytest.raises(ValueError, match="missing a handoff event"):
@@ -647,7 +737,7 @@ def test_verifier_rejects_a_missing_lifecycle_event() -> None:
 
 def test_verifier_reports_a_refund_beyond_the_remaining_ledger() -> None:
     """The policy amount is authoritative, so the gap is reported not rewritten."""
-    from student_agent.workflow import verify
+    from student_agent.agents import verify
 
     output = _clean_output()
     output["payment_analysis"]["captured_total_brl"] = 10.0
@@ -659,7 +749,7 @@ def test_verifier_reports_a_refund_beyond_the_remaining_ledger() -> None:
 def _calibrate(payment: PaymentFinding, **kwargs: Any) -> float:
     from decimal import Decimal
 
-    from student_agent.workflow import calibrate
+    from student_agent.agents import calibrate
 
     facts = OrderFacts(
         order_value=Decimal("89.00"), item_ids=["i"], seller_ids=["s"], product_confirmed=True
@@ -680,7 +770,7 @@ def _calibrate(payment: PaymentFinding, **kwargs: Any) -> float:
 def test_calibration_stays_short_of_certainty_and_tracks_evidence() -> None:
     from decimal import Decimal
 
-    from student_agent.workflow import MAX_CONFIDENCE
+    from student_agent.agents import MAX_CONFIDENCE
 
     settled = PaymentFinding(available=True, captured_total=Decimal("18"))
     clean = _calibrate(settled)
@@ -698,7 +788,7 @@ def test_calibration_stays_short_of_certainty_and_tracks_evidence() -> None:
 
 
 def test_insufficient_evidence_is_reported_with_low_confidence() -> None:
-    from student_agent.workflow import calibrate
+    from student_agent.agents import calibrate
 
     value = calibrate(
         "insufficient_evidence",
@@ -713,8 +803,8 @@ def test_insufficient_evidence_is_reported_with_low_confidence() -> None:
 
 
 def test_lifecycle_validation_enforces_the_scoring_policy_events() -> None:
+    from student_agent.agents import required_lifecycle_events
     from student_agent.submission import _validate_lifecycle
-    from student_agent.workflow import required_lifecycle_events
 
     required = required_lifecycle_events()
     assert "case_received" in required
@@ -745,3 +835,366 @@ def test_lifecycle_validation_enforces_the_scoring_policy_events() -> None:
         _validate_lifecycle(full[1:] + [line("case_received")])
     with pytest.raises(ValueError, match="repeats case_received"):
         _validate_lifecycle([full[0], *full])
+
+
+def test_identical_revisions_collapse_to_one_payment_per_sequential(tmp_path: Path) -> None:
+    """Two byte-identical copies of one revision are one capture, not two.
+
+    Nothing separates them: same instant, same amount, same sequential, and no
+    refund to point at either.  Reporting both would double the captured total.
+    """
+    from decimal import Decimal
+
+    from student_agent.agents import investigate_payment
+
+    row = {
+        "order_id": ORDER_ID,
+        "payment_sequential": "1",
+        "payment_type": "credit_card",
+        "payment_value": "89.00",
+    }
+    capture = {
+        "order_id": ORDER_ID,
+        "event_at": "2018-05-11T10:00:00-03:00",
+        "event_type": "captured",
+        "amount_brl": "89.00",
+        "status": "confirmed",
+    }
+    gateway = FakeGateway(
+        {
+            "get_payment_timeline": envelope(
+                "payment",
+                {
+                    "order_id": ORDER_ID,
+                    "payments": [row, dict(row)],
+                    "events": [capture, dict(capture)],
+                },
+            ),
+            "get_refund_timeline": RuntimeError("no refund lifecycle"),
+        }
+    )
+    scope = scope_stub(
+        status="unavailable",
+        purchase_at=_moment("2018-05-11T09:00:00-03:00"),
+        approved_at=_moment("2018-05-11T10:00:00-03:00"),
+        estimated_at=_moment("2018-05-21T09:00:00-03:00"),
+    )
+    facts = OrderFacts(order_value=Decimal("99.00"), seller_ids=["seller-af0bbb47f125"])
+    payment = asyncio.run(
+        investigate_payment(
+            desk_for(tmp_path, gateway, shipment=ShipmentFinding(available=True)), scope, facts
+        )
+    )
+
+    assert payment.capture_ambiguous is True
+    assert payment.capture_trimmed_to_capacity is True
+    assert payment.capture_unresolved is False
+    assert payment.capture_amounts == [Decimal("89.00")]
+    assert payment.captured_total == Decimal("89.00")
+    assert payment.refundable_total == Decimal("89.00")
+    assert payment.duplicate_capture is False
+    assert payment.references == ["1"]
+    assert classify(scope, facts, ShipmentFinding(available=True), payment) == (
+        "unavailable_order_paid"
+    )
+
+
+def test_a_genuine_duplicate_survives_the_capacity_rule(tmp_path: Path) -> None:
+    """Two sequentials paid twice over is a real duplicate, not a collision."""
+    from decimal import Decimal
+
+    from student_agent.agents import investigate_payment
+
+    def row(sequential: str, kind: str) -> dict[str, Any]:
+        return {
+            "order_id": ORDER_ID,
+            "payment_sequential": sequential,
+            "payment_type": kind,
+            "payment_value": "64.00",
+        }
+
+    def capture() -> dict[str, Any]:
+        return {
+            "order_id": ORDER_ID,
+            "event_at": "2018-05-11T10:00:00-03:00",
+            "event_type": "captured",
+            "amount_brl": "64.00",
+            "status": "confirmed",
+        }
+
+    gateway = FakeGateway(
+        {
+            "get_payment_timeline": envelope(
+                "payment",
+                {
+                    "order_id": ORDER_ID,
+                    "payments": [
+                        row("1", "credit_card"),
+                        row("2", "voucher"),
+                        row("1", "credit_card"),
+                        row("2", "voucher"),
+                    ],
+                    "events": [capture(), capture()],
+                },
+            ),
+            "get_refund_timeline": RuntimeError("no refund lifecycle"),
+        }
+    )
+    scope = scope_stub(
+        purchase_at=_moment("2018-05-11T09:00:00-03:00"),
+        approved_at=_moment("2018-05-11T10:00:00-03:00"),
+        delivered_at=_moment("2018-05-17T09:00:00-03:00"),
+        estimated_at=_moment("2018-05-18T09:00:00-03:00"),
+    )
+    facts = OrderFacts(order_value=Decimal("89.00"), seller_ids=["seller-af0bbb47f125"])
+    payment = asyncio.run(
+        investigate_payment(
+            desk_for(tmp_path, gateway, shipment=ShipmentFinding(available=True)), scope, facts
+        )
+    )
+
+    assert payment.capture_ambiguous is False
+    assert payment.captured_total == Decimal("128.00")
+    assert payment.duplicate_capture is True
+    assert classify(
+        scope, facts, ShipmentFinding(available=True, verdict="on_time"), payment
+    ) == "duplicate_charge"
+
+
+def test_the_revision_open_at_case_intake_is_the_subject(tmp_path: Path) -> None:
+    """get_order may answer with a revision purchased after the case was opened.
+
+    No complaint can be about an order placed later, so the customer history
+    decides: the subject is the newest revision already placed at intake.
+    """
+    later = order_row(
+        order_purchase_timestamp="2018-05-11T09:00:00-03:00",
+        order_approved_at="2018-05-11T10:00:00-03:00",
+        order_delivered_customer_date="2018-05-20T09:00:00-03:00",
+        order_estimated_delivery_date="2018-05-21T09:00:00-03:00",
+    )
+    at_intake = order_row(
+        order_status="canceled",
+        order_purchase_timestamp="2017-12-20T09:00:00-03:00",
+        order_approved_at="2017-12-20T10:00:00-03:00",
+        order_delivered_carrier_date="2017-12-22T09:00:00-03:00",
+        order_delivered_customer_date=None,
+        order_estimated_delivery_date="2017-12-30T09:00:00-03:00",
+    )
+    gateway = FakeGateway(
+        {
+            "get_order": envelope("order", later),
+            "get_customer_history": envelope(
+                "customer",
+                {"customer_unique_id": CUSTOMER_ID, "orders": [later, at_intake]},
+                ref="ev_" + "e" * 24,
+            ),
+        }
+    )
+    case = case_file()
+    case["opened_at"] = "2018-01-01T09:00:00-03:00"
+    scope = asyncio.run(resolve_entity(desk_for(tmp_path, gateway), case))
+
+    assert scope.resolved is True
+    assert scope.revision_source == "get_customer_history"
+    assert scope.revision_differs is True
+    assert scope.history_revisions == 2
+    # The scoped timeline is the one open at intake, not the one get_order gave.
+    assert scope.status == "canceled"
+    assert scope.purchase_at == _moment("2017-12-20T09:00:00-03:00")
+    assert scope.delivered_at is None
+    assert scope.estimated_at == _moment("2017-12-30T09:00:00-03:00")
+
+
+def test_a_single_revision_is_taken_as_given(tmp_path: Path) -> None:
+    gateway = FakeGateway(
+        {
+            "get_order": envelope("order", order_row()),
+            "get_customer_history": envelope(
+                "customer",
+                {"customer_unique_id": CUSTOMER_ID, "orders": [order_row()]},
+                ref="ev_" + "f" * 24,
+            ),
+        }
+    )
+    scope = asyncio.run(resolve_entity(desk_for(tmp_path, gateway), case_file()))
+    assert scope.revision_differs is False
+    assert scope.history_revisions == 1
+    assert scope.status == "delivered"
+    assert scope.purchase_at == _moment("2018-05-11T09:00:00-03:00")
+
+
+def test_the_scoped_revision_owns_its_delivery_timeline(tmp_path: Path) -> None:
+    """The shipment summary answers for the order id, so it carries both revisions.
+
+    A canceled revision that never shipped must not inherit the other
+    revision's delivery date, or a late event would be attributed to it.
+    """
+    from student_agent.agents import investigate_shipment
+
+    gateway = FakeGateway(
+        {
+            "get_shipment_summary": envelope(
+                "shipment",
+                {
+                    "order_id": ORDER_ID,
+                    "order_status": "delivered",
+                    "delivered_carrier_at": "2018-05-13T09:00:00-03:00",
+                    "delivered_customer_at": "2018-05-20T09:00:00-03:00",
+                    "estimated_delivery_at": "2018-05-21T09:00:00-03:00",
+                    "shipping_limits": [],
+                    "events": [
+                        {
+                            "order_id": ORDER_ID,
+                            "event_at": "2018-05-20T09:00:00-03:00",
+                            "event_type": "delivered_late",
+                            "actor": "seller",
+                            "status": "confirmed",
+                        }
+                    ],
+                },
+            )
+        }
+    )
+    scope = scope_stub(
+        status="canceled",
+        purchase_at=_moment("2017-12-20T09:00:00-03:00"),
+        approved_at=_moment("2017-12-20T10:00:00-03:00"),
+        delivered_at=None,
+        estimated_at=_moment("2017-12-30T09:00:00-03:00"),
+    )
+    facts = OrderFacts(seller_ids=["seller-af0bbb47f125"])
+    finding = asyncio.run(investigate_shipment(desk_for(tmp_path, gateway), scope, facts))
+
+    assert finding.available is True
+    assert finding.verdict == "insufficient_evidence"
+    assert finding.late_seller_ids == []
+    assert finding.timeline_complete is False
+    assert finding.out_of_scope_events == 1
+
+
+def test_duplicate_order_lines_are_counted_once(tmp_path: Path) -> None:
+    """Colliding revisions repeat the same line; billing it twice doubles the order."""
+    from decimal import Decimal
+
+    from student_agent.agents import investigate_order
+
+    line = {
+        "order_id": ORDER_ID,
+        "order_item_id": "item-af0bbb47f125",
+        "product_id": "product-af0bbb47f125",
+        "seller_id": "seller-af0bbb47f125",
+        "shipping_limit_date": "2018-05-14T09:00:00-03:00",
+        "price": "79.00",
+        "freight_value": "10.00",
+    }
+    gateway = FakeGateway(
+        {
+            "get_order_items": envelope("item", [line, dict(line)]),
+            "get_product_context": envelope(
+                "product", [{"order_item_id": "item-af0bbb47f125"}]
+            ),
+        }
+    )
+    scope = scope_stub(purchase_at=_moment("2018-05-11T09:00:00-03:00"))
+    facts = asyncio.run(investigate_order(desk_for(tmp_path, gateway), scope))
+
+    assert facts.item_ids == ["item-af0bbb47f125"]
+    assert facts.seller_ids == ["seller-af0bbb47f125"]
+    assert facts.order_value == Decimal("89.00")
+    assert facts.out_of_scope_rows == 1
+    assert facts.product_confirmed is True
+
+
+def test_packaging_refuses_results_no_evidence_stands_behind() -> None:
+    """A gateway outage yields a full set of empty results; it must not ship."""
+    from student_agent.submission import _validate_evidence_present
+
+    good = {"schema_version": "day09-l3b-output-v2", "evidence_refs": [REF]}
+    barren = {"schema_version": "day09-l3b-output-v2", "evidence_refs": []}
+
+    _validate_evidence_present({"L3B_CASE_001": good})
+    with pytest.raises(ValueError, match="no output cites any evidence"):
+        _validate_evidence_present({"L3B_CASE_001": barren})
+    with pytest.raises(ValueError, match="cite no evidence"):
+        _validate_evidence_present({"L3B_CASE_001": good, "L3B_CASE_002": barren})
+
+
+def test_a_task_group_failure_reports_its_real_cause() -> None:
+    """The MCP transport wraps everything in a task group; unwrap it to report."""
+    from student_agent.cli import _primary_error, _transient_only
+
+    real = RuntimeError("the MCP Gateway returned no evidence")
+    nested = BaseExceptionGroup("tg", [BaseExceptionGroup("inner", [real])])
+    assert _primary_error(nested) is real
+    assert _transient_only(nested) is False
+
+    dropped = ConnectionError("reset")
+    assert _primary_error(BaseExceptionGroup("tg", [dropped])) is dropped
+    assert _transient_only(BaseExceptionGroup("tg", [dropped])) is True
+
+    # A real fault alongside transport noise is the one worth showing.
+    mixed = BaseExceptionGroup("tg", [dropped, real])
+    assert _primary_error(mixed) is real
+    assert _transient_only(mixed) is False
+
+
+def _sellers_gateway() -> FakeGateway:
+    return FakeGateway(
+        {
+            "get_sellers": envelope(
+                "seller",
+                [
+                    {
+                        "seller_id": "seller-af0bbb47f125",
+                        "seller_zip_code_prefix": "01001",
+                        "seller_city": "sao_paulo",
+                        "seller_state": "SP",
+                    }
+                ],
+                ref="ev_" + "g" * 24,
+            )
+        }
+    )
+
+
+def test_the_seller_record_backs_a_seller_being_held_answerable(tmp_path: Path) -> None:
+    from student_agent.agents import confirm_sellers
+
+    gateway = _sellers_gateway()
+    facts = OrderFacts(seller_ids=["seller-af0bbb47f125"])
+    shipment = ShipmentFinding(available=True, verdict="seller_delay")
+    asyncio.run(confirm_sellers(desk_for(tmp_path, gateway), scope_stub(), facts, shipment))
+
+    assert facts.seller_confirmed is True
+    assert [name for name, _ in gateway.calls] == ["get_sellers"]
+
+
+def test_an_unavailable_order_also_reaches_for_the_seller_record(tmp_path: Path) -> None:
+    from student_agent.agents import confirm_sellers
+
+    gateway = _sellers_gateway()
+    facts = OrderFacts(seller_ids=["seller-af0bbb47f125"])
+    asyncio.run(
+        confirm_sellers(
+            desk_for(tmp_path, gateway),
+            scope_stub(status="unavailable"),
+            facts,
+            ShipmentFinding(available=True),
+        )
+    )
+    assert facts.seller_confirmed is True
+
+
+def test_no_seller_implicated_means_no_seller_call(tmp_path: Path) -> None:
+    """Evidence that supports nothing is not requested and not cited."""
+    from student_agent.agents import confirm_sellers
+
+    gateway = _sellers_gateway()
+    facts = OrderFacts(seller_ids=["seller-af0bbb47f125"])
+    shipment = ShipmentFinding(available=True, verdict="on_time")
+    asyncio.run(confirm_sellers(desk_for(tmp_path, gateway), scope_stub(), facts, shipment))
+
+    assert facts.seller_confirmed is False
+    assert gateway.calls == []
+    assert trace_events(tmp_path) == []

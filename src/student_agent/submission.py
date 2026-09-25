@@ -81,11 +81,27 @@ def validate_artifacts(
         normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
 
     _validate_lifecycle(trace_lines)
+    _validate_evidence_present(outputs)
 
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):
         raise ValueError("a Team API Key appears in output or trace")
     return outputs, normalized_lines
+
+
+def _validate_evidence_present(outputs: dict[str, dict[str, Any]]) -> None:
+    """Refuse a set of results that no MCP evidence stands behind.
+
+    Missing required evidence is a hard gate, so packaging a run the gateway was
+    unavailable for would submit a guaranteed zero.
+    """
+    barren = [case_id for case_id, output in outputs.items() if not output["evidence_refs"]]
+    if len(barren) == len(outputs):
+        raise ValueError(
+            "no output cites any evidence; re-run against the MCP Gateway before packaging"
+        )
+    if barren:
+        raise ValueError(f"{len(barren)} outputs cite no evidence, starting with {barren[0]}")
 
 
 def _validate_lifecycle(trace_lines: list[str]) -> None:
@@ -95,7 +111,7 @@ def _validate_lifecycle(trace_lines: list[str]) -> None:
     ordering, so this reads the whole trace file rather than one case's view of
     it and confirms both before a submission is built.
     """
-    from .workflow import required_lifecycle_events
+    from .agents import required_lifecycle_events
 
     per_case: dict[str, list[str]] = {}
     for line in trace_lines:

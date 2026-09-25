@@ -12,7 +12,7 @@ import httpx2
 from .cases import CaseSet, load_case_set
 from .config import Settings
 from .contracts import Contracts
-from .mcp_gateway import connect_gateway
+from .mcp_gateway import EvidenceGateway, connect_gateway
 from .submission import package_submission, validate_artifacts
 from .trace import TraceWriter
 from .workflow import solve_case
@@ -29,6 +29,9 @@ TRANSIENT_FAULTS = (
 )
 MAX_SESSIONS = 60
 MAX_CASE_FAULTS = 3
+# A gateway that answers nothing produces a full set of empty, submittable
+# results.  Stop instead, so an outage is never mistaken for a finished run.
+MAX_BARREN_CASES = 3
 
 
 def _root(value: str) -> Path:
@@ -41,6 +44,23 @@ def _transient_only(error: BaseException) -> bool:
             _transient_only(inner) for inner in error.exceptions
         )
     return isinstance(error, TRANSIENT_FAULTS)
+
+
+def _primary_error(error: BaseException) -> BaseException:
+    """The exception worth showing from inside a task-group failure.
+
+    The MCP transport runs the session in an anyio task group, so anything
+    raised while driving it reaches the caller wrapped in an exception group.
+    Printing the group gives a page of nested tracebacks instead of the one
+    sentence that says what went wrong.
+    """
+    if not isinstance(error, BaseExceptionGroup) or not error.exceptions:
+        return error
+    unwrapped = [_primary_error(inner) for inner in error.exceptions]
+    for candidate in unwrapped:
+        if not isinstance(candidate, TRANSIENT_FAULTS):
+            return candidate
+    return unwrapped[0]
 
 
 async def _show_tools(root: Path) -> None:
@@ -56,6 +76,30 @@ def _write_output(output_root: Path, case_id: str, output: dict[str, Any]) -> No
     temporary = target.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(target)
+
+
+def _outage_report(gateway: EvidenceGateway, barren: int, case_id: str) -> str:
+    """Why the run is being abandoned, in the gateway's own words.
+
+    The agents treat a refused tool as an empty scope, so by the time the run
+    gives up the reason has been swallowed several hundred times over.  Quote
+    the last refusal rather than guessing at the cause.
+    """
+    lines = [
+        f"the MCP Gateway returned no evidence for {barren} "
+        f"{'case' if barren == 1 else 'cases'} in a row (last: {case_id}).",
+        f"  tool calls: {gateway.answered} answered, {gateway.refused} refused.",
+    ]
+    if gateway.last_refusal:
+        lines.append(f"  the gateway's last reply: {gateway.last_refusal}")
+    if not gateway.answered and gateway.refused:
+        lines.append(
+            "  Tool discovery works and the arguments passed the tools' own schemas, "
+            "so the gateway is failing inside every tool rather than rejecting this "
+            "client - check whether the competition round is still open."
+        )
+    lines.append("Refusing to write a run with no evidence behind it.")
+    return "\n".join(lines)
 
 
 async def _drive_session(
@@ -77,6 +121,7 @@ async def _drive_session(
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
+        barren = 0
         for case_id in pending:
             case = case_set.cases[case_id]
             trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
@@ -84,6 +129,11 @@ async def _drive_session(
             contracts.validate_output(output, f"outputs/{case_id}.json")
             if output.get("case_id") != case_id:
                 raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+            barren = 0 if output["evidence_refs"] else barren + 1
+            # A session that has answered nothing will answer nothing for the
+            # next case either, so one barren case is already the whole story.
+            if barren >= MAX_BARREN_CASES or (barren and not gateway.answered):
+                raise RuntimeError(_outage_report(gateway, barren, case_id))
             _write_output(output_root, case_id, output)
             trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
             progress["done"].append(case_id)
@@ -182,6 +232,10 @@ def main() -> None:
         elif args.command == "package":
             destination = package_submission(root, root / args.output)
             print(f"OK: {destination}")
+    except BaseExceptionGroup as group:
+        error = _primary_error(group)
+        print(f"ERROR: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

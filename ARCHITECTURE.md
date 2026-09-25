@@ -26,25 +26,34 @@ flowchart TD
 | `coordinator` | Case file | Route once, own the verified order scope | none | Scoped case to each specialist |
 | `entity-agent` | Claimed and candidate identifiers, customer hint | Confirm exactly one order; reject every other candidate | `get_order`, `get_customer_history` | Verified `OrderScope` to coordinator |
 | `order-agent` | Verified order | Item and seller membership, order value | `get_order_items`, `get_product_context` | Item facts with evidence refs |
-| `shipment-agent` | Verified order | Compare promised, handed-over and delivered timestamps | `get_shipment_summary` | Timeline verdict with evidence refs |
+| `shipment-agent` | Verified order, confirmed items | Compare promised, handed-over and delivered timestamps; read the seller record where one is answerable | `get_shipment_summary`, `get_sellers` | Timeline verdict with evidence refs |
 | `payment-agent` | Verified order, order value | Reconcile captures, track the refund lifecycle | `get_payment_timeline`, `get_refund_timeline` | Monetary findings with evidence refs |
 | `conflict-agent` | Contradictory sourced values | Name both sources and the precedence rule applied | none | `data_conflicts` entries |
 | `policy-agent` | Scoped findings, `policy_version` | Read the published rule table, decide status, action and amount | `get_policy` | Supported recommendation |
 | `verifier-agent` | Proposed L3B object, evidence ledger | Reconciliation, scope, ownership and chronology checks | none | Validated output or a rejection |
 
-`solve_case(case, gateway, trace)` in `src/student_agent/workflow.py` runs this sequence. The runner in `cli.py` emits `case_received` before the call and `case_finalized` after it, so the workflow itself never duplicates those two events.
+`solve_case(case, gateway, trace)` in `src/student_agent/workflow.py` runs this sequence. The code is split three ways: `workflow.py` holds the coordinator and nothing else, `a2a.py` holds the protocol — `A2AMessage`, the `CaseContext` and the routing — and `agents.py` holds the specialists with the domain reasoning they own. The runner in `cli.py` emits `case_received` before the call and `case_finalized` after it, so the workflow itself never duplicates those two events.
+
+## Agent-to-agent protocol
+
+No agent holds the gateway, the trace, or another agent. Each is handed the `CaseContext` and answers with one `A2AMessage` naming its sender, recipient, intent and the references it stands behind. Routing a message through the context is the same act as recording it, which is what makes the trace an audit of the run rather than a commentary on it:
+
+- **An assignment is checked, not trusted.** A specialist holds the order, episode and window it was handed against the scope the entity agent actually proved, and raises `ProtocolViolation` on a mismatch, so a mis-routed task cannot quietly widen the scope.
+- **A cited reference must be owned.** `CaseContext` refuses any reply quoting an `evidence_ref` this case never consumed, so a fabricated reference cannot reach the output by way of a handoff.
+- **The review chain is a chain.** `conflict-agent` refers to `policy-agent`, which refers to `verifier-agent`, which alone may answer `finalize`. A referral back to its own sender, or a chain that never finalises, is a violation rather than a silent result.
+- **Parallel specialists stay honest.** `shipment-agent` and `payment-agent` run concurrently. A payment cannot decide whether a refund still matters until the shipment verdict is in, so the payment agent waits for that announcement at the one point it needs it — and only when the refund could still change the outcome.
 
 ## MCP Evidence Gateway discipline
 
-`EvidenceDesk` is the only door to the gateway, so all five gateway rules hold in one place:
+`CaseContext` is the only door to the gateway, so all five gateway rules hold in one place:
 
-1. **`case_id` on every call.** `EvidenceDesk.fetch` supplies it from the case under investigation; a specialist cannot omit or override it. The server refuses an identifier belonging to another case, which is the intended behaviour and is treated as "no evidence", never worked around.
+1. **`case_id` on every call.** `CaseContext.fetch` supplies it from the case under investigation; a specialist cannot omit or override it. The server refuses an identifier belonging to another case, which is the intended behaviour and is treated as "no evidence", never worked around.
 2. **References are never synthesised.** `evidence_ref` is copied verbatim out of the envelope into `EvidenceLedger`. The ledger is created per `solve_case` call, so it cannot hold a reference from another case, and the output can only cite what the ledger holds.
-3. **Only supporting evidence is cited.** Each tool answers a field the output actually carries. `get_order_payments` is skipped because `get_payment_timeline` returns the same payment rows plus the lifecycle events, and `get_sellers` is skipped because no output field depends on seller address data — `seller_id` already arrives with the items.
+3. **Only supporting evidence is cited.** Each tool answers a field the output actually carries. `get_order_payments` is skipped because `get_payment_timeline` returns the same payment rows plus the lifecycle events. `get_sellers` is requested only where a seller is actually held answerable — a `seller_delay` verdict or an unavailable order — because that is where `responsible_parties` and `late_seller_ids` name one; elsewhere the seller record would support nothing.
 4. **`tool_result_consumed` after validation only.** The event is emitted once the envelope has passed `mcp-evidence-response-v1` in `EvidenceGateway.call` and the tool's declared domain matches `TOOL_DOMAINS`. A wrong-domain envelope is discarded with no event and no ledger entry.
 5. **The client trace mirrors the server audit.** Every consumed envelope produces exactly one event naming the actor, the tool and the single reference, so the client sequence can be reconciled against the server's independent hash, latency and status audit.
 
-Per case the run spends eight calls: `get_order`, `get_customer_history`, `get_order_items`, `get_product_context`, `get_shipment_summary`, `get_payment_timeline`, `get_refund_timeline`, `get_policy`. A tool-level refusal is a final answer and is not retried; only a timeout or transport fault gets a second attempt, capped at two per argument set. Requests are read only and idempotent.
+Per case the run spends seven calls — `get_order`, `get_customer_history`, `get_order_items`, `get_product_context`, `get_shipment_summary`, `get_payment_timeline`, `get_policy` — plus `get_refund_timeline` only where the case can still turn on a refund. A canceled or unavailable order, an open reconciliation mismatch or a confirmed late delivery already outranks any refund state, so asking there would spend an audited call on evidence that cannot change the outcome. A tool-level refusal is a final answer and is not retried; only a timeout or transport fault gets a second attempt, capped at two per argument set. Requests are read only and idempotent.
 
 ## Entity resolution
 
@@ -52,19 +61,31 @@ A candidate identifier in the case file is a lead, not a fact. It becomes the sc
 
 ## Source precedence
 
-The gateway returns two revisions of the same `order_id`: the authoritative row from `get_order`, and a second row the customer history also carries, anchored on a different purchase timestamp. Every downstream row therefore has to be attributed before it can be used.
+The gateway holds more than one revision under the same `order_id`: `get_order` answers with exactly one of them, and `get_customer_history` returns them all. The one `get_order` returns is often purchased *after* the case was opened, and no complaint can be about an order placed later, so it cannot be taken as the subject on its own.
+
+**The case intake timestamp settles it.** The subject is the newest revision already placed at `opened_at`; where none precedes intake, the earliest is taken. That revision's own row supplies `order_status` and the whole delivery timeline, and every downstream row is then attributed to it:
 
 | Row | In scope when | Precedence rule |
 | --- | --- | --- |
-| Order | Returned by `get_order` | `AUTHORITATIVE_ORDER_ROW_PRECEDES_HISTORY` |
-| Item, shipping limit | `shipping_limit_date` within 21 days after the authoritative purchase | `ITEM_SCOPED_TO_PURCHASE_WINDOW` |
-| Capture, reconciliation event | Within 6 hours of the authoritative `order_approved_at` | `CAPTURE_SCOPED_TO_ORDER_APPROVED_AT` |
-| Refund event | Repays one in-scope capture amount, within 45 days of the authoritative delivery | `CAPTURE_SCOPED_TO_ORDER_APPROVED_AT` |
-| Shipment event | Within one day of the authoritative `delivered_customer_at` | `EVENT_OUTSIDE_AUTHORITATIVE_DELIVERY` |
+| Order revision | Newest revision placed at or before `opened_at` | `REVISION_OPEN_AT_CASE_INTAKE` |
+| Item, shipping limit | `shipping_limit_date` within 21 days after the subject's purchase | `ITEM_SCOPED_TO_PURCHASE_WINDOW` |
+| Capture, reconciliation event | Within 6 hours of the subject's `order_approved_at` | `CAPTURE_SCOPED_TO_ORDER_APPROVED_AT` |
+| Refund event | Repays one in-scope capture, within 45 days of the subject's delivery | `CAPTURE_SCOPED_TO_ORDER_APPROVED_AT` |
+| Shipment event | Within one day of the subject's `delivered_customer_at` | `EVENT_OUTSIDE_AUTHORITATIVE_DELIVERY` |
+
+`get_shipment_summary` answers for the whole `order_id`, so its delivery timestamps describe whichever revision shipped. Once a revision is scoped, that revision owns its timeline and the summary cannot override it — otherwise a canceled revision that never shipped would inherit the other one's delivery date and a late event would be pinned on it.
 
 Each rejected row is reported as a `data_conflicts` entry naming both sources and the rule that selected the winner. `selected_source` stays `null` only when no documented rule resolves the field.
 
-When the two revisions share a purchase timestamp the windows above cannot separate them, and the payment window over-collects. That condition is detectable: one revision holds at most one payment per `payment_sequential`, so more in-window captures than the order has distinct sequentials means the attribution is ambiguous. The refund lifecycle is raised against the revision under investigation, so the amount it repays names the authoritative capture — `CAPTURE_SCOPED_BY_REFUND_LIFECYCLE`. Without a refund, the captures landing exactly on `order_approved_at` are preferred. If neither narrows the set, the conflict is reported with `selected_source: null` and `CAPTURE_REVISION_UNRESOLVED` rather than resolved by guesswork. Skipping this step would read a colliding pair of split payments as a duplicate charge and recommend the wrong refund.
+### When revisions collide
+
+Two revisions can share a purchase timestamp, and then the windows above cannot separate them. That is detectable rather than silent: a revision bills each `order_item_id` once and holds at most one payment per `payment_sequential`, so more rows than that means the attribution is ambiguous. Duplicate order lines are collapsed first — counting the same line twice would double the order value. The captures are then resolved in this order:
+
+1. The subset that sums to exactly the order value, since the revision under investigation is the one whose payments settle it — `CAPTURE_SETTLES_THE_ORDER_VALUE`.
+2. The amount an in-scope refund repays, because a refund is raised against the revision under investigation — `CAPTURE_SCOPED_BY_REFUND_LIFECYCLE`.
+3. The captures landing exactly on `order_approved_at`.
+4. Failing all of those, when both revisions are byte-identical copies, the set is trimmed to one payment per sequential — `CAPTURE_TRIMMED_TO_SEQUENTIAL_CAPACITY`.
+5. Only if nothing narrows it is the conflict reported with `selected_source: null` and `CAPTURE_REVISION_UNRESOLVED`, rather than resolved by guesswork.
 
 `payment_references` lists only the sequentials whose `payment_value` matches a capture kept in scope, so the reported references, `captured_total_brl` and the refund lines all describe the same revision.
 
@@ -113,13 +134,15 @@ Calibration is graded as one minus the squared error between whether the primary
 | --- | --- |
 | No policy rule applied | −0.20 |
 | Capture revision unresolved | −0.25 |
-| Capture revision ambiguous but resolved | −0.08 |
+| Capture revision ambiguous, resolved by refund or instant | −0.08 |
+| Capture revision trimmed to sequential capacity | −0.05 |
 | Shipment or payment evidence unavailable | −0.10 |
 | Incomplete timeline behind a delivery issue | −0.10 |
 | Incomplete timeline otherwise | −0.03 |
 | Order value unknown behind a split or duplicate finding | −0.15 |
 | No confirmed item membership | −0.05 |
 | No independent product confirmation | −0.03 |
+| A seller is answerable but unconfirmed in the registry | −0.04 |
 | More than one revision of this order on record | −0.02 |
 | The customer's own account corroborates the finding | +0.03 |
 
